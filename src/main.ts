@@ -106,17 +106,59 @@ export default class ObsyncPlugin extends Plugin {
   private shareIndicatorObserver?: MutationObserver;
   private shareIndicatorRefreshTimer?: number;
   private shareCatalogLastLoadedAt = 0;
+  private backgroundedAt?: number;
+  private lastResumeReconnectAt = 0;
+  private resumeReconnectTimer?: number;
 
   async onload(): Promise<void> {
     await this.loadSettings();
 
     this.addSettingTab(new ObsyncSettingTab(this.app, this));
 
+    const syncRibbon = this.addRibbonIcon("refresh-cw", t("ribbon_sync"), () => {
+      void this.syncNow();
+    });
+    syncRibbon.addClass("obsync-ribbon-sync");
+
+    const pullRibbon = this.addRibbonIcon("cloud-download", t("ribbon_pull_server"), () => {
+      void this.pullFromServer();
+    });
+    pullRibbon.addClass("obsync-ribbon-pull");
+
+    this.addCommand({
+      id: "obsync-sync-now",
+      name: t("cmd_sync_now"),
+      callback: () => {
+        void this.syncNow();
+      },
+    });
+
     this.addCommand({
       id: "obsync-show-status",
       name: t("cmd_show_status"),
       callback: () => {
         this.notice(this.statusText);
+      },
+    });
+
+    this.addCommand({
+      id: "obsync-pull-from-server",
+      name: t("cmd_pull_server"),
+      callback: () => {
+        void this.pullFromServer();
+      },
+    });
+
+    this.addCommand({
+      id: "obsync-compare-current-with-server",
+      name: t("cmd_compare_server"),
+      callback: () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || this.kindForFile(file) !== "markdown") {
+          this.notice("notice_open_markdown_first");
+          return;
+        }
+        void this.showServerConflict(file.path);
       },
     });
 
@@ -147,6 +189,7 @@ export default class ObsyncPlugin extends Plugin {
     this.registerFileMenu();
     this.registerShareIndicators();
     this.registerVaultEvents();
+    this.registerResumeSync();
 
     if (this.settings.safeMode) {
       const message = this.settings.lastStartupFailure || t("status_waiting");
@@ -168,10 +211,44 @@ export default class ObsyncPlugin extends Plugin {
     this.syncClient?.disconnect();
     this.bridge?.dispose();
     this.shareIndicatorObserver?.disconnect();
+    if (this.resumeReconnectTimer) {
+      window.clearTimeout(this.resumeReconnectTimer);
+    }
     if (this.shareIndicatorRefreshTimer) {
       window.clearTimeout(this.shareIndicatorRefreshTimer);
     }
     this.echoSuppression.clear();
+  }
+
+  private registerResumeSync(): void {
+    const resumeAfterLongPause = (): void => {
+      const pausedForMs = this.backgroundedAt ? Date.now() - this.backgroundedAt : 0;
+      this.backgroundedAt = undefined;
+      if (pausedForMs >= 15_000) this.scheduleResumeReconnect();
+    };
+
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.hidden) {
+        this.backgroundedAt = Date.now();
+        return;
+      }
+      resumeAfterLongPause();
+    });
+    this.registerDomEvent(window, "focus", resumeAfterLongPause);
+    this.registerDomEvent(window, "online", () => this.scheduleResumeReconnect());
+  }
+
+  private scheduleResumeReconnect(): void {
+    if (!this.settings.enabled || this.settings.safeMode) return;
+    if (Date.now() - this.lastResumeReconnectAt < 2_000 || this.resumeReconnectTimer) return;
+
+    this.resumeReconnectTimer = window.setTimeout(() => {
+      this.resumeReconnectTimer = undefined;
+      if (!this.settings.enabled || this.settings.safeMode) return;
+      this.lastResumeReconnectAt = Date.now();
+      this.syncClient?.disconnect();
+      this.syncClient?.connect();
+    }, 150);
   }
 
   async loadSettings(): Promise<void> {
@@ -436,6 +513,7 @@ export default class ObsyncPlugin extends Plugin {
 
       for (let index = 0; index < serverFiles.length; index += 1) {
         const serverFile = serverFiles[index];
+        this.settings.fileIds[serverFile.path] = serverFile.fileId;
         processedServerBytes += serverFile.sizeBytes ?? 0;
         const totalFiles = serverFiles.length || 1;
         this.setProgress(
@@ -1187,6 +1265,8 @@ export default class ObsyncPlugin extends Plugin {
       }
     }
 
+    await this.reconcileServerFileIdentities(this.httpApi);
+
     this.syncClient = new SyncClient(() => this.settings, () => this.saveSettings());
     this.syncClient.onEvent((event) => this.handleSyncEvent(event));
     this.bridge = new VaultEventBridge(
@@ -1202,6 +1282,23 @@ export default class ObsyncPlugin extends Plugin {
     this.settings.lastStartupFailureAt = undefined;
     await this.saveSettings();
     this.syncClient.connect();
+  }
+
+  private async reconcileServerFileIdentities(api: SyncHttpApi): Promise<void> {
+    try {
+      const manifest = await api.manifest();
+      let changed = false;
+      for (const file of manifest) {
+        if (file.deletedAt || file.kind === "folder") continue;
+        if (this.settings.fileIds[file.path] !== file.fileId) {
+          this.settings.fileIds[file.path] = file.fileId;
+          changed = true;
+        }
+      }
+      if (changed) await this.saveSettings();
+    } catch (error) {
+      console.warn("[obsync] could not reconcile server file identities", error);
+    }
   }
 
   private async handleStartupSyncError(error: unknown): Promise<void> {
@@ -1245,6 +1342,122 @@ export default class ObsyncPlugin extends Plugin {
 
   async uploadLocalVault(): Promise<void> {
     await this.installVault();
+  }
+
+  async pullFromServer(): Promise<void> {
+    if (this.syncJobRunning || this.publicationJobRunning) {
+      this.notice("notice_sync_already_running");
+      return;
+    }
+
+    await this.ensureManualSyncReady();
+    const { api, bridge } = this.manualSyncContext();
+    this.syncJobRunning = true;
+    let created = 0;
+    let updated = 0;
+    const conflicts: string[] = [];
+
+    try {
+      const manifest = await api.manifest();
+      const serverFiles = this.downloadableServerFiles(manifest, bridge);
+      for (const serverFile of serverFiles) {
+        this.settings.fileIds[serverFile.path] = serverFile.fileId;
+        const local = this.app.vault.getAbstractFileByPath(serverFile.path);
+        if (!(local instanceof TFile)) {
+          const result = await this.downloadServerFile(api, bridge, serverFile, false);
+          if (result === "created") created += 1;
+          continue;
+        }
+        if (!serverFile.hash) continue;
+        const localHash = await this.localFileHash(local);
+        if (localHash === serverFile.hash) {
+          this.trackServerFile(serverFile);
+          continue;
+        }
+        const lastHash = this.settings.lastFileHashes[serverFile.path];
+        if (lastHash && lastHash === localHash) {
+          const result = await this.downloadServerFile(api, bridge, serverFile, true);
+          if (result === "updated") updated += 1;
+          continue;
+        }
+        conflicts.push(serverFile.path);
+      }
+      await this.saveSettings();
+      this.setProgress(t("progress_pull_completed", { created, updated, conflicts: conflicts.length }));
+      this.notice("notice_pull_completed", { created, updated, conflicts: conflicts.length }, 10000);
+      if (conflicts.length > 0) new ServerConflictsModal(this, conflicts).open();
+    } catch (error) {
+      const message = this.errorMessage(error);
+      this.notice("notice_pull_failed", { message }, 12000);
+    } finally {
+      this.syncJobRunning = false;
+    }
+  }
+
+  async showServerConflict(path: string): Promise<void> {
+    await this.ensureManualSyncReady();
+    const { api } = this.manualSyncContext();
+    const serverFile = (await api.manifest()).find((item) => !item.deletedAt && item.path === path);
+    const local = this.app.vault.getAbstractFileByPath(path);
+    if (!serverFile || !(local instanceof TFile) || this.kindForFile(local) !== "markdown") {
+      this.notice("notice_compare_unavailable");
+      return;
+    }
+    const seq = serverFile.updatedSeq;
+    if (seq === undefined) {
+      this.notice("notice_compare_unavailable");
+      return;
+    }
+    const [version, localContent] = await Promise.all([
+      api.historyVersion(path, seq),
+      this.app.vault.read(local),
+    ]);
+    new ServerConflictDiffModal(this, path, seq, version.content, localContent, serverFile.hash).open();
+  }
+
+  async acceptServerVersion(path: string, serverSeq: number, content: string, hash?: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) throw new Error(t("error_note_not_found"));
+    this.echoSuppression.suppress(path);
+    await this.app.vault.modify(file, content);
+    if (hash) this.settings.lastFileHashes[path] = hash;
+    this.settings.lastFileSeqs[path] = serverSeq;
+    await this.saveSettings();
+    this.notice("notice_server_version_applied", { path });
+  }
+
+  async saveMergedVersion(path: string, expectedServerSeq: number, expectedServerHash: string | undefined, content: string): Promise<void> {
+    if (this.syncJobRunning) { this.notice("notice_sync_job_running"); return; }
+    await this.ensureManualSyncReady();
+    const { api } = this.manualSyncContext();
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) throw new Error(t("error_note_not_found"));
+    this.syncJobRunning = true;
+    try {
+      const current = (await api.manifest()).find((item) => !item.deletedAt && item.path === path);
+      if (!current || current.updatedSeq !== expectedServerSeq || (expectedServerHash && current.hash !== expectedServerHash)) {
+        throw new Error(t("error_server_changed_during_merge"));
+      }
+      const encoded = new TextEncoder().encode(content);
+      const body = encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength);
+      const result = await api.uploadFile({
+        fileId: current.fileId, path, kind: "markdown", body, mtimeMs: Date.now(),
+        contentType: "text/markdown; charset=utf-8",
+        expectedCurrentHash: current.hash, expectedCurrentSeq: current.updatedSeq,
+      });
+      this.echoSuppression.suppress(path);
+      await this.app.vault.modify(file, content);
+      this.settings.lastFileHashes[path] = result.hash;
+      this.settings.fileIds[path] = result.fileId;
+      if (result.operation?.serverSeq) {
+        this.settings.lastFileSeqs[path] = result.operation.serverSeq;
+        this.syncClient?.sendMarkdownSnapshot({ sourcePath: path, sourceHash: result.hash, sourceSeq: result.operation.serverSeq, markdown: content });
+      }
+      await this.saveSettings();
+      this.notice("notice_merge_saved", { path });
+    } finally {
+      this.syncJobRunning = false;
+    }
   }
 
   async downloadVaultFromServer(): Promise<void> {
@@ -1584,7 +1797,7 @@ export default class ObsyncPlugin extends Plugin {
       throw new Error(t("error_note_not_found"));
     }
     const currentContent = await this.app.vault.read(current);
-    new HistoryDiffModal(this, path, version.serverSeq, version.content, currentContent).open();
+    new ServerConflictDiffModal(this, path, version.serverSeq, version.content, currentContent, version.hash).open();
   }
 
   private async loadHistoryVersion(path: string, serverSeq: number): Promise<{
@@ -1634,7 +1847,6 @@ export default class ObsyncPlugin extends Plugin {
     }
 
     if (event.type === "ack") {
-      this.settings.lastCursor = Math.max(this.settings.lastCursor, event.serverSeq);
       this.applyPendingSeqUpdate(event.opId, event.serverSeq);
       await this.saveSettings();
       return;
@@ -1777,7 +1989,6 @@ export default class ObsyncPlugin extends Plugin {
   }
 
   private isStaleSyncOperation(operation: { serverSeq: number; path?: string }): boolean {
-    if (operation.serverSeq <= this.settings.lastCursor) return true;
     if (!operation.path) return false;
     const lastSeq = this.settings.lastFileSeqs[operation.path];
     return lastSeq !== undefined && operation.serverSeq <= lastSeq;
@@ -2477,6 +2688,150 @@ class NoteHistoryModal extends Modal {
   }
 }
 
+class ServerConflictsModal extends Modal {
+  constructor(private readonly plugin: ObsyncPlugin, private readonly paths: string[]) { super(plugin.app); }
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: t("conflicts_modal_title") });
+    contentEl.createEl("p", { text: t("conflicts_modal_desc", { count: this.paths.length }) });
+    for (const path of this.paths) {
+      const row = contentEl.createDiv({ cls: "obsync-conflict-row" });
+      row.createEl("span", { text: path });
+      const button = row.createEl("button", { text: t("conflicts_compare") });
+      button.onclick = () => { this.close(); void this.plugin.showServerConflict(path).catch((error) => { new Notice(`${t("notice_prefix")}: ${errorMessage(error)}`, 12000); }); };
+    }
+  }
+}
+
+class ServerConflictDiffModal extends Modal {
+  private armed = false;
+  private localArmed = false;
+  constructor(
+    private readonly plugin: ObsyncPlugin, private readonly path: string,
+    private readonly serverSeq: number, private readonly serverContent: string,
+    private readonly localContent: string, private readonly serverHash?: string,
+  ) { super(plugin.app); }
+  onOpen(): void {
+    const { contentEl, modalEl } = this;
+    modalEl.addClass("obsync-diff-modal");
+    contentEl.empty();
+    contentEl.addClass("obsync-conflict-diff");
+    contentEl.createEl("h2", { text: t("server_diff_title") });
+    contentEl.createEl("p", { text: this.path });
+    const grid = contentEl.createDiv({ cls: "obsync-diff-grid" });
+    const serverPane = grid.createDiv({ cls: "obsync-diff-pane is-server-pane" });
+    const localPane = grid.createDiv({ cls: "obsync-diff-pane is-local-pane" });
+    serverPane.createDiv({ cls: "obsync-diff-pane-title", text: t("server_diff_server_title") });
+    localPane.createDiv({ cls: "obsync-diff-pane-title", text: t("server_diff_local_title") });
+    const serverBody = serverPane.createDiv({ cls: "obsync-diff-pane-body" });
+    const localBody = localPane.createDiv({ cls: "obsync-diff-pane-body" });
+    let serverLine = 0;
+    let localLine = 0;
+    for (const line of diffLines(this.serverContent, this.localContent)) {
+      const onlyLocal = line.prefix === "+";
+      const onlyServer = line.prefix === "-";
+      if (!onlyLocal) serverLine += 1;
+      if (!onlyServer) localLine += 1;
+      this.renderDiffLine(serverBody, onlyLocal ? undefined : serverLine, onlyLocal ? "" : line.text, onlyLocal ? "is-empty" : onlyServer ? "is-changed" : "");
+      this.renderDiffLine(localBody, onlyServer ? undefined : localLine, onlyServer ? "" : line.text, onlyServer ? "is-empty" : onlyLocal ? "is-changed" : "");
+    }
+    let syncingScroll = false;
+    const mirrorScroll = (source: HTMLElement, target: HTMLElement) => {
+      if (syncingScroll) return;
+      syncingScroll = true;
+      target.scrollTop = source.scrollTop;
+      target.scrollLeft = source.scrollLeft;
+      window.requestAnimationFrame(() => { syncingScroll = false; });
+    };
+    serverBody.addEventListener("scroll", () => mirrorScroll(serverBody, localBody));
+    localBody.addEventListener("scroll", () => mirrorScroll(localBody, serverBody));
+    const actions = contentEl.createDiv({ cls: "obsync-conflict-actions" });
+    const keepButton = actions.createEl("button", { text: t("server_diff_keep_local") });
+    keepButton.onclick = () => {
+      if (!this.localArmed) { this.localArmed = true; keepButton.setText(t("server_diff_keep_local_confirm")); return; }
+      keepButton.disabled = true;
+      void this.plugin.saveMergedVersion(this.path, this.serverSeq, this.serverHash, this.localContent)
+        .then(() => this.close()).catch((error) => { keepButton.disabled = false; new Notice(t("notice_prefix") + ": " + errorMessage(error), 12000); });
+    };
+    const mergeButton = actions.createEl("button", { text: t("server_diff_merge") });
+    mergeButton.addClass("mod-cta");
+    mergeButton.onclick = () => {
+      new MergeConflictModal(this.plugin, this.path, this.serverSeq, this.serverContent, this.localContent, this.serverHash).open();
+      this.close();
+    };
+    const acceptButton = actions.createEl("button", { text: t("server_diff_accept") });
+    acceptButton.addClass("mod-warning");
+    acceptButton.onclick = () => {
+      if (!this.armed) { this.armed = true; acceptButton.setText(t("server_diff_accept_confirm")); return; }
+      acceptButton.disabled = true;
+      void this.plugin.acceptServerVersion(this.path, this.serverSeq, this.serverContent, this.serverHash)
+        .then(() => this.close()).catch((error) => {
+          acceptButton.disabled = false;
+          new Notice(`${t("notice_prefix")}: ${errorMessage(error)}`, 12000);
+        });
+    };
+  }
+
+  private renderDiffLine(parent: HTMLElement, lineNumber: number | undefined, text: string, state: string): void {
+    const row = parent.createDiv({ cls: "obsync-diff-line" });
+    if (state) row.addClass(state);
+    row.createSpan({ cls: "obsync-diff-line-number", text: lineNumber === undefined ? "" : String(lineNumber) });
+    const code = row.createEl("code", { cls: "obsync-diff-line-code" });
+    code.setText(text || " ");
+  }
+}
+
+class MergeConflictModal extends Modal {
+  constructor(
+    private readonly plugin: ObsyncPlugin, private readonly path: string,
+    private readonly serverSeq: number, private readonly serverContent: string,
+    private readonly localContent: string, private readonly serverHash?: string,
+  ) { super(plugin.app); }
+
+  onOpen(): void {
+    const { contentEl, modalEl } = this;
+    modalEl.addClass("obsync-merge-modal");
+    contentEl.empty();
+    contentEl.createEl("h2", { text: t("merge_title") });
+    contentEl.createEl("p", { cls: "obsync-merge-path", text: this.path });
+    const columns = contentEl.createDiv({ cls: "obsync-merge-grid" });
+    const server = this.readonlyPane(columns, t("server_diff_server_title"), this.serverContent, "is-server-source");
+    const local = this.readonlyPane(columns, t("server_diff_local_title"), this.localContent, "is-local-source");
+    void server; void local;
+    const resultPane = columns.createDiv({ cls: "obsync-merge-pane is-result-pane" });
+    const resultHeader = resultPane.createDiv({ cls: "obsync-merge-pane-title" });
+    resultHeader.createSpan({ text: t("merge_result_title") });
+    const quick = resultHeader.createDiv({ cls: "obsync-merge-quick" });
+    const useServer = quick.createEl("button", { text: t("merge_use_server") });
+    const useLocal = quick.createEl("button", { text: t("merge_use_local") });
+    const editor = resultPane.createEl("textarea", { cls: "obsync-merge-editor" });
+    editor.value = this.localContent;
+    editor.spellcheck = false;
+    useServer.onclick = () => { editor.value = this.serverContent; editor.focus(); };
+    useLocal.onclick = () => { editor.value = this.localContent; editor.focus(); };
+    const actions = contentEl.createDiv({ cls: "obsync-conflict-actions" });
+    const cancel = actions.createEl("button", { text: t("merge_cancel") });
+    cancel.onclick = () => this.close();
+    const save = actions.createEl("button", { text: t("merge_save") });
+    save.addClass("mod-cta");
+    save.onclick = () => {
+      save.disabled = true;
+      void this.plugin.saveMergedVersion(this.path, this.serverSeq, this.serverHash, editor.value)
+        .then(() => this.close()).catch((error) => { save.disabled = false; new Notice(t("notice_prefix") + ": " + errorMessage(error), 12000); });
+    };
+    window.setTimeout(() => { editor.focus(); editor.setSelectionRange(editor.value.length, editor.value.length); }, 0);
+  }
+
+  private readonlyPane(parent: HTMLElement, title: string, content: string, cls: string): HTMLElement {
+    const pane = parent.createDiv({ cls: "obsync-merge-pane " + cls });
+    pane.createDiv({ cls: "obsync-merge-pane-title", text: title });
+    const pre = pane.createEl("pre", { cls: "obsync-merge-source" });
+    pre.setText(content);
+    return pane;
+  }
+}
+
 class HistoryContentModal extends Modal {
   constructor(
     private readonly plugin: ObsyncPlugin,
@@ -2521,41 +2876,6 @@ class HistoryContentModal extends Modal {
         new Notice(`${t("notice_prefix")}: ${t("notice_restore_failed", { message })}`, 12000);
       });
     };
-  }
-}
-
-class HistoryDiffModal extends Modal {
-  constructor(
-    private readonly plugin: ObsyncPlugin,
-    private readonly path: string,
-    private readonly serverSeq: number,
-    private readonly oldContent: string,
-    private readonly currentContent: string,
-  ) {
-    super(plugin.app);
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl("h2", { text: t("history_diff_title") });
-    contentEl.createEl("p", {
-      text: t("history_diff_to_current", {
-        path: this.path,
-        seq: t("history_seq_label", { value: this.serverSeq }),
-      }),
-    });
-    const pre = contentEl.createEl("pre");
-    pre.style.whiteSpace = "pre-wrap";
-    pre.style.maxHeight = "60vh";
-    pre.style.overflow = "auto";
-
-    for (const line of diffLines(this.oldContent, this.currentContent)) {
-      const span = pre.createEl("span");
-      span.setText(`${line.prefix} ${line.text}\n`);
-      if (line.prefix === "+") span.style.color = "var(--text-success)";
-      if (line.prefix === "-") span.style.color = "var(--text-error)";
-    }
   }
 }
 

@@ -152,10 +152,6 @@ export class SyncClient {
     try {
       const message = JSON.parse(String(raw));
       if (message.type === "operation" && message.operation) {
-        const serverSeq = Number(message.operation.serverSeq);
-        if (Number.isFinite(serverSeq) && serverSeq <= this.getSettings().lastCursor) {
-          return;
-        }
         this.emit({ type: "operation", operation: message.operation });
         return;
       }

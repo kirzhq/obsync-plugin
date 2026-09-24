@@ -420,6 +420,14 @@ export class ObsyncSettingTab extends PluginSettingTab {
             await this.plugin.syncNow();
             this.display();
           });
+      })
+      .addButton((button) => {
+        button
+          .setButtonText(t("cmd_pull_server"))
+          .onClick(async () => {
+            await this.plugin.pullFromServer();
+            this.display();
+          });
       });
 
     const progressSetting = new Setting(connectionSection)
